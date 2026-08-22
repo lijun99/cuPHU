@@ -1886,7 +1886,7 @@ int cuphu_unwrap(
          * Two confidence gates on top of the raw coherence>0.05 floor:
          *  - conf_mask_t: excludes pixels invalid under the REAL (un-padded)
          *    mask. Without this, a tile whose own PCG solve got corrupted
-         *    through a thin mask_pad_distance-padded connection (no real
+         *    through a thin mask_buffer-padded connection (no real
          *    signal there by construction) can leak that corruption into
          *    this tile's *entire* whole-tile stitching offset -- confirmed
          *    on real data: a handful of padded-through pixels skewed the

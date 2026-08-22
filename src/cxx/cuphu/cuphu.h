@@ -197,7 +197,7 @@ void cuphu_default_bridge_params(CuPhuBridgeParams *bp);
  *                  of isce3's bridge_unwrapped_phase()
  * @param orig_mask Optional (may be NULL). The *real*, un-padded validity
  *                  mask -- distinct from `mask`, which the caller may have
- *                  grown (e.g. via mask_pad_distance) purely to give the
+ *                  grown (e.g. via mask_buffer) purely to give the
  *                  PCG solve connectivity through otherwise-isolated
  *                  features. Padded-through pixels carry no real
  *                  interferometric signal (that's the whole point of
@@ -210,7 +210,7 @@ void cuphu_default_bridge_params(CuPhuBridgeParams *bp);
  *                  every downstream tile) instead of being excluded as
  *                  low-confidence. When NULL, falls back to `mask` --
  *                  i.e. no behavior change for callers not using
- *                  mask_pad_distance.
+ *                  mask_buffer.
  * @param gpu_id    CUDA device ID (0 = first GPU)
  * @param result    Output – caller must free result->unw and result->conncomp
  * @return          0 on success, nonzero on failure

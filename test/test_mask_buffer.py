@@ -1,4 +1,4 @@
-"""Tests for the mask_pad_distance parameter (solve through a grown valid
+"""Tests for the mask_buffer parameter (solve through a grown valid
 region, but report validity at the original mask)."""
 
 import numpy as np
@@ -38,7 +38,7 @@ gpu_only = pytest.mark.skipif(not _has_gpu(), reason="no CUDA GPU available")
 @gpu_only
 def test_conncomp_restored_to_original_mask():
     """Padded-through pixels must never be reported as valid, regardless
-    of mask_pad_distance."""
+    of mask_buffer."""
     nrow, ncol = 100, 100
     unw_true = 0.05 * np.arange(ncol)[None, :] * np.ones((nrow, 1))
     igram = np.exp(1j * unw_true).astype(np.complex64)
@@ -47,13 +47,15 @@ def test_conncomp_restored_to_original_mask():
     mask[:, 40:60] = 0
 
     for pad in [0, 5, 20, 50]:
-        _, cc = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_pad_distance=pad)
+        _, cc = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_buffer=pad)
         assert (cc[:, 40:60] == 0).all(), f"pad={pad} leaked padded pixels into conncomp"
         assert (cc[:, :40] != 0).any(), f"pad={pad} left valid region entirely unlabeled"
 
 
 @gpu_only
-def test_default_zero_matches_no_padding():
+def test_default_matches_64():
+    """Omitting mask_buffer must match passing the documented default (64)
+    explicitly."""
     nrow, ncol = 60, 60
     unw_true = 0.04 * np.arange(ncol)[None, :] * np.ones((nrow, 1))
     igram = np.exp(1j * unw_true).astype(np.complex64)
@@ -62,14 +64,28 @@ def test_default_zero_matches_no_padding():
     mask[:, 25:35] = 0
 
     unw_a, cc_a = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask)
-    unw_b, cc_b = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_pad_distance=0)
+    unw_b, cc_b = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_buffer=64)
     np.testing.assert_array_equal(unw_a, unw_b)
     np.testing.assert_array_equal(cc_a, cc_b)
 
 
 @gpu_only
+def test_zero_disables_padding():
+    """mask_buffer=0 must still be available to disable padding entirely."""
+    nrow, ncol = 60, 60
+    unw_true = 0.04 * np.arange(ncol)[None, :] * np.ones((nrow, 1))
+    igram = np.exp(1j * unw_true).astype(np.complex64)
+    corr = np.full((nrow, ncol), 0.8, dtype=np.float32)
+    mask = np.ones((nrow, ncol), dtype=np.uint8)
+    mask[:, 25:35] = 0
+
+    unw, cc = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_buffer=0)
+    assert (cc[:, 25:35] == 0).all()
+
+
+@gpu_only
 def test_feedback_uses_original_not_padded_mask():
-    """Regression test: found on a real scene where mask_pad_distance and
+    """Regression test: found on a real scene where mask_buffer and
     laplace_neighbor_feedback were combined. The padded-through pixels are
     a PCG-continued fiction with no real interferometric signal (that is
     the whole point of padding -- give the solver connectivity, not
@@ -80,7 +96,7 @@ def test_feedback_uses_original_not_padded_mask():
     inject a multi-radian spurious drift into the neighboring tile.
     Confirmed on the real scene (row-median roughness 0.17 rad, vs 0.03
     matching an independent MCF reference, once fixed). Fixed by running
-    feedback against the ORIGINAL mask even when mask_pad_distance > 0.
+    feedback against the ORIGINAL mask even when mask_buffer > 0.
 
     Reproduced synthetically: a mainland tile boundary with a small
     isolated island's boundary pixels valid but *only* connected to the
@@ -102,7 +118,7 @@ def test_feedback_uses_original_not_padded_mask():
     corr = np.full((nrow, ncol), 0.8, dtype=np.float32)
     kwargs = dict(
         nlooks=10.0, init="laplace", ntiles=(1, 2), tile_overlap=(0, 64),
-        mask=mask, mask_pad_distance=100,
+        mask=mask, mask_buffer=100,
         laplace_neighbor_feedback_feather=50,
     )
     unw_fb, _ = cuphu.unwrap(igram, corr, laplace_neighbor_feedback=True, **kwargs)
@@ -134,8 +150,8 @@ def test_padding_helps_isolated_feature():
     mask[60:90, 60:75] = 1                # narrow connecting neck (invalid gap otherwise)
     mask[60:90, 75:100] = 1               # isolated spit
 
-    unw0, cc0 = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_pad_distance=0)
-    unw20, cc20 = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_pad_distance=20)
+    unw0, cc0 = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_buffer=0)
+    unw20, cc20 = cuphu.unwrap(igram, corr, nlooks=10.0, mask=mask, mask_buffer=20)
 
     assert unw0.shape == (nrow, ncol)
     assert unw20.shape == (nrow, ncol)

@@ -19,7 +19,7 @@ entirely on GPU.
 |---|---|---|---|---|
 | **MCF** | `'mcf'` | GPU cost + CPU network-flow | Exact match to SNAPHU-MCF | **Recommended default.** Best when you need an exact match to SNAPHU (e.g. validation baselines). Auto-tiles with `nproc` for speed at scale. |
 | **MST** | `'mst'` | GPU cost + CPU spanning tree | To be tested | Not recommended until validated. |
-| **Laplace PCG** | `'laplace'` | Runs entirely on GPU | Match MCF to within noise on most scenes | Fastest option, especially on large scenes (auto-tiles, no CPU threads needed). Prefer when speed matters most; pair with `single_tile_reoptimize`/`fix_cycle_spikes` to clean up occasional PCG-specific artifacts on very large scenes. |
+| **Laplace PCG** | `'laplace'` | Runs entirely on GPU | Match MCF to within noise on most scenes | Fastest option, especially on large scenes (auto-tiles, no CPU threads needed). Prefer when speed matters most; `single_tile_reoptimize`/`fix_cycle_spikes` clean up tile-boundary and network-flow artifacts on any tiled run, regardless of `init` (isce3's own workflow defaults both on). |
 
 
 ## Requirements
@@ -215,25 +215,25 @@ cuphu.unwrap(
     cost="smooth",            # 'smooth' | 'defo'  (statistical cost mode)
     init="mcf",               # 'laplace' | 'mcf' | 'mst'
     mask=None,                # uint8/bool mask — 0 means invalid pixel
-    mask_pad_distance=0,      # grow valid mask by N px before solving (see notes)
+    mask_buffer=64,           # grow valid mask by N px before solving (0 disables)
     mag=None,                 # float32 amplitude (derived from igram if None)
     min_conncomp_frac=0.01,   # minimum connected component as fraction of total
     phase_grad_window=(7, 7), # boxcar averaging window for wrapped gradients
     ntiles=None,              # (row, col) tile count; auto-computed if None
-    tile_overlap=None,        # pixel overlap between adjacent tiles
+    tile_overlap=None,        # pixel overlap between adjacent tiles (64 if None)
     target_tile_size=1024,    # target tile edge (px), used to auto-compute ntiles
     nproc=1,                  # CPU threads for parallel tile network-flow solves
-    tile_cost_thresh=500,
-    min_region_size=100,
+    tile_cost_thresh=500,     # cost threshold for reliable tile regions
+    min_region_size=100,      # minimum pixels in a reliable tile region
     single_tile_reoptimize=False,  # CPU re-solve of the whole scene after tiling
     fix_cycle_spikes=False,   # detect/correct isolated row/column 2π spikes
     bridge=False,             # reconcile disconnected regions' whole-cycle offsets
-    bridge_radius=500,
-    bridge_min_num_pixel=14,
-    bridge_erosion_size=2,
-    bridge_max_boundary_samples=4096,
+    bridge_radius=500,        # AOI half-size (px) for per-bridge median comparison
+    bridge_min_num_pixel=14,  # drop regions smaller than this before bridging
+    bridge_erosion_size=2,    # structuring-element size (px) for region pruning
+    bridge_max_boundary_samples=4096,  # cap on boundary points sampled per region
     bridge_ramp_type=None,    # ramp to remove before bridging, add back after
-    bridge_ramp_max_num_sample=1000000,
+    bridge_ramp_max_num_sample=1000000,  # subsample cap for the ramp fit
     reference_pixel=(0, 0),   # shift output to match this pixel's raw wrapped phase
     gpu_id=0,                 # CUDA device index
     unw=None,                 # pre-allocated float32 output array
@@ -282,6 +282,31 @@ levels even though they're both physically part of the same continuous
 deformation field. `bridge=True` reconciles this after the solve, so the
 whole scene comes out on one consistent level:
 
+`cuphu.build_water_mask()` builds an invalid-pixel mask (True = invalid,
+same convention as isce3's own mask composition — the *opposite* of
+`unwrap()`'s own `mask=` argument below, so invert it before passing in)
+from a water-distance raster, in either of two conventions:
+
+```python
+# NISAR convention: water_distance encodes 0=land, 1-100=distance from
+# coastline (ocean), 101-200=100+distance from inland water boundary.
+invalid = cuphu.build_water_mask(
+    water_distance,
+    ocean_water_buffer=1.0,   # same units as water_distance
+    inland_water_buffer=1.0,
+)
+
+# Generic convention: water_distance (or any raster) is just nonzero-is-water.
+invalid = cuphu.build_water_mask(water_distance, water_buffer=5)  # px
+
+unw, conncomp = cuphu.unwrap(igram, corr, nlooks, mask=~invalid)
+```
+
+Either way the buffer extends the *valid* region a short distance into
+the water near the boundary rather than shrinking it — the same kind of
+operation as `mask_buffer` below, just from a distance-encoded input
+instead of spatial dilation.
+
 ```python
 unw, conncomp = cuphu.unwrap(
     igram, corr, nlooks,
@@ -300,7 +325,7 @@ across a narrow gap, the raw median comparison can pick the wrong
 whole-cycle jump; `bridge_ramp_type` (e.g. `'linear'`, `'quadratic'`)
 fits and removes a ramp before comparing, then adds it back after.
 
-Combine with `mask_pad_distance` if the mask also has narrow/isolated
+Combine with `mask_buffer` if the mask also has narrow/isolated
 valid slivers near a boundary that need a bit of padding to solve
 reliably.
 

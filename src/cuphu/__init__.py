@@ -20,6 +20,7 @@ from cuphu._unwrap import unwrap
 from cuphu._conncomp import regrow_conncomp
 from cuphu._gpu import gpu_count, gpu_info, gpu_name
 from cuphu._looks import get_effective_looks
+from cuphu._water import build_water_mask
 
 try:
     __version__ = _pkg_version("cuphu")
@@ -28,6 +29,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "__version__",
+    "build_water_mask",
     "get_effective_looks",
     "gpu_count",
     "gpu_info",

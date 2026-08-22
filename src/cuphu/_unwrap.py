@@ -21,11 +21,17 @@ from cuphu.io import InputDataset, OutputDataset
 
 __all__ = ["unwrap"]
 
-# Default overlap (px) for auto-tiled Laplace runs -- large enough that a
-# tile boundary's overlap strip gives a robust median registration estimate
+# Default overlap (px) for any tiled run -- large enough that a tile
+# boundary's overlap strip gives a robust median registration estimate
 # even if part of it crosses a decorrelated feature, small enough to keep
 # redundant (solved-twice) compute a small fraction of tile area.
-_DEFAULT_LAPLACE_TILE_OVERLAP = 64
+_DEFAULT_TILE_OVERLAP = 64
+
+# Default mask_buffer (px) -- a mask boundary left unbuffered can strand a
+# narrow valid feature on the wrong whole-cycle branch for both mcf/mst
+# and laplace; 64px is a reasonable general-purpose minimum absent any
+# scene-specific tuning.
+_DEFAULT_MASK_BUFFER = 64
 
 
 def _auto_ntiles_by_target_size(nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp):
@@ -97,7 +103,7 @@ def unwrap(
     init: str = "mcf",
     *,
     mask: InputDataset | None = None,
-    mask_pad_distance: int = 0,
+    mask_buffer: int = _DEFAULT_MASK_BUFFER,
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
     phase_grad_window: tuple[int, int] = (7, 7),
@@ -134,7 +140,7 @@ def unwrap(
     init: str = "mcf",
     *,
     mask: InputDataset | None = None,
-    mask_pad_distance: int = 0,
+    mask_buffer: int = _DEFAULT_MASK_BUFFER,
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
     phase_grad_window: tuple[int, int] = (7, 7),
@@ -172,7 +178,7 @@ def unwrap(  # type: ignore[no-untyped-def]
     init="mcf",
     *,
     mask=None,
-    mask_pad_distance=0,
+    mask_buffer=_DEFAULT_MASK_BUFFER,
     mag=None,
     min_conncomp_frac=0.01,
     phase_grad_window=(7, 7),
@@ -226,12 +232,15 @@ def unwrap(  # type: ignore[no-untyped-def]
         on large scenes. Defaults to ``'mcf'``.
     mask : array_like, bool/uint8, 2-D, optional
         Binary valid-pixel mask. Zero means invalid. Defaults to None.
-    mask_pad_distance : int, optional
+    mask_buffer : int, optional
         Grow the valid region of *mask* by this many pixels before solving
         (via ``pixels`` rounds of 4-connectivity dilation), then restore
         the original *mask* for the reported ``conncomp`` (padded pixels
         are excluded from the final output; their raw ``unw`` values are
         left as solved, same as any other masked pixel in this API).
+        Defaults to 64 -- an unbuffered mask boundary can strand a narrow
+        valid feature on the wrong whole-cycle branch, for both mcf/mst
+        and laplace. Pass 0 to disable.
 
         For ``init='laplace'``: fixes a real failure mode, not just a
         cosmetic one. Narrow or isolated valid features right at a mask
@@ -284,10 +293,9 @@ def unwrap(  # type: ignore[no-untyped-def]
     tile_overlap : int or (int, int) or None, optional
         Pixel overlap between adjacent tiles, used to register tiles
         against each other (median offset over the shared region). If
-        None (default): 0 for ``init='mcf'``/``'mst'`` (historical
-        behavior), 64 for ``init='laplace'`` (needed for the auto-tiling
-        above to register tiles correctly -- explicitly pass 0 only if
-        also passing ``ntiles=(1, 1)``).
+        None (default): 64 for every init method -- explicitly pass 0
+        only alongside a single-tile ``ntiles=(1, 1)``, where there are no
+        tile boundaries to register.
     target_tile_size : int, optional
         Target tile edge length in pixels, including overlap, used to
         auto-compute *ntiles* when *ntiles* is None, for ``init='laplace'``
@@ -481,11 +489,11 @@ def unwrap(  # type: ignore[no-untyped-def]
     if nproc < 1:
         nproc = os.cpu_count() or 1
 
-    # normalize tile_overlap -- default depends on init: laplace tiling
-    # needs overlap to register tiles (see ntiles below), mcf/mst historically
-    # defaulted to none.
+    # normalize tile_overlap -- same default for every init method (tiling
+    # without overlap has no way to register tiles against each other,
+    # regardless of solver).
     if tile_overlap is None:
-        tile_overlap = _DEFAULT_LAPLACE_TILE_OVERLAP if init == "laplace" else 0
+        tile_overlap = _DEFAULT_TILE_OVERLAP
     if np.ndim(tile_overlap) == 0:
         tile_overlap = (int(tile_overlap), int(tile_overlap))
     row_ovrlp, col_ovrlp = tile_overlap
@@ -527,12 +535,12 @@ def unwrap(  # type: ignore[no-untyped-def]
     mag_f32  = (np.ascontiguousarray(mag, dtype=np.float32)
                 if mag is not None else None)
 
-    # mask_pad_distance: solve through a grown valid region (real
+    # mask_buffer: solve through a grown valid region (real
     # convergence/connectivity benefit -- see docstring), but only ever
     # report the ORIGINAL mask's validity in the output.
     solve_mask_u8 = mask_u8
-    if mask_u8 is not None and mask_pad_distance > 0:
-        solve_mask_u8 = _dilate_mask(mask_u8 != 0, int(mask_pad_distance)).astype(np.uint8)
+    if mask_u8 is not None and mask_buffer > 0:
+        solve_mask_u8 = _dilate_mask(mask_u8 != 0, int(mask_buffer)).astype(np.uint8)
 
     # Padding + neighbor_feedback interact badly if feedback runs against
     # the *padded* mask: the padded-through pixels are a PCG-continued
@@ -546,14 +554,14 @@ def unwrap(  # type: ignore[no-untyped-def]
     # feedback off internally in that case, then reapply feedback
     # separately (same underlying routine) using the ORIGINAL, unpadded
     # mask, so the correction only ever trusts genuinely real boundary
-    # pixels -- exactly where mask_pad_distance's own gap-filling logic
+    # pixels -- exactly where mask_buffer's own gap-filling logic
     # (bounded fade, not unbounded extrapolation) is designed to help.
     # single_tile_reoptimize supersedes laplace_neighbor_feedback (redundant
     # once reoptimize re-solves the whole scene, validated slightly worse).
     effective_neighbor_feedback = laplace_neighbor_feedback and not single_tile_reoptimize
 
     feedback_needs_orig_mask = (
-        mask_u8 is not None and mask_pad_distance > 0 and effective_neighbor_feedback
+        mask_u8 is not None and mask_buffer > 0 and effective_neighbor_feedback
     )
     internal_feedback = effective_neighbor_feedback and not feedback_needs_orig_mask
 
@@ -597,7 +605,7 @@ def unwrap(  # type: ignore[no-untyped-def]
             mask_u8, ntilerow, ntilecol, row_ovrlp, col_ovrlp,
             int(laplace_neighbor_feedback_feather))
 
-    if mask_u8 is not None and mask_pad_distance > 0:
+    if mask_u8 is not None and mask_buffer > 0:
         # restore the ORIGINAL mask's validity for reporting -- padded
         # pixels solved-through for convergence are not reported as valid.
         cc_out = np.where(mask_u8 != 0, cc_out, 0).astype(cc_out.dtype)
