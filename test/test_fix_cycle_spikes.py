@@ -51,6 +51,54 @@ def test_fix_cycle_spikes_corrects_isolated_column() -> None:
 
 
 @gpu_only
+def test_fix_cycle_spikes_corrects_partial_row_spike() -> None:
+    """A spike confined to only part of a row's width (tied to one local
+    feature, not the whole row) must still be caught -- a whole-row median
+    would dilute it below detection. Confirmed against a real scene: a
+    single-row spike covering ~20% of the row's width, invisible to a
+    whole-row median. Spike starts on a block boundary (even partition of
+    600 columns into TARGET_BLOCK_LEN=128-ish blocks: [0,120,240,360,480,
+    600]) so it's fully contained in whole blocks."""
+    nrow, ncol = 60, 600
+    r_idx, c_idx = np.mgrid[0:nrow, 0:ncol]
+    ramp = 0.01 * r_idx + 0.005 * c_idx
+    unw = ramp.astype(np.float32).copy()
+    unw[27, 240:] -= np.float32(TWO_PI)   # spike over the last two blocks only
+
+    unw_out = _cuphu_ext._fix_cycle_spikes_test(unw)
+
+    np.testing.assert_allclose(unw_out, ramp, atol=1e-3)
+
+
+@gpu_only
+def test_fix_cycle_spikes_even_split_leaves_straddled_block_uncorrected() -> None:
+    """Documents a known edge case: when a spike's true boundary falls
+    inside a block rather than on a block edge, that block mixes shifted
+    and unshifted pixels. Its median lands on whichever portion is the
+    (robust) majority -- if that's close enough to a clean 2*pi multiple,
+    the whole block is corrected, including the minority portion it
+    shouldn't touch; otherwise the block is left alone, including the
+    minority portion that should have been corrected. Either way, that one
+    straddled block is not fully right. This test picks a clean 50/50
+    split (column 300, the midpoint of the even-partitioned [240,360)
+    block: [0,120,240,360,480,600]), which is left alone -- neither side
+    is a clear majority, so no correction fires for this block."""
+    nrow, ncol = 60, 600
+    r_idx, c_idx = np.mgrid[0:nrow, 0:ncol]
+    ramp = 0.01 * r_idx + 0.005 * c_idx
+    unw = ramp.astype(np.float32).copy()
+    unw[27, 300:] -= np.float32(TWO_PI)
+
+    unw_out = _cuphu_ext._fix_cycle_spikes_test(unw)
+
+    # blocks fully before or after the straddling one are corrected
+    np.testing.assert_allclose(unw_out[27, :240], ramp[27, :240], atol=1e-3)
+    np.testing.assert_allclose(unw_out[27, 360:], ramp[27, 360:], atol=1e-3)
+    # the straddled block [240, 360) is left exactly as it was
+    np.testing.assert_array_equal(unw_out[27, 240:360], unw[27, 240:360])
+
+
+@gpu_only
 def test_fix_cycle_spikes_ignores_smooth_ramp() -> None:
     """A row-to-row difference that does not round to a common nonzero
     cycle count on both sides (a genuine smooth gradient) must be left

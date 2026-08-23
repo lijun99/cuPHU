@@ -1375,61 +1375,100 @@ void cuphu_bridge_apply_test(
  * a real 240M-pixel single_tile_reoptimize run: 17 such isolated rows out
  * of 18240, no local coherence anomaly at any of them.
  *
- * Detection is per-row (then per-column): compare each row's median
- * against its two immediate neighbors' medians. A spike is a row whose
- * offset from both neighbors rounds to the same nonzero cycle count,
- * within tolerance -- neighbors that already disagree with each other
- * (a real, gradual scene trend) never round to a common count, so a
- * genuine smooth ramp is left untouched.
+ * Detection is per-row (then per-column), in column blocks: compare each
+ * row's per-block median against its two immediate neighbors' medians for
+ * that same block. A spike is a (row, block) whose offset from both
+ * neighbors rounds to the same nonzero cycle count, within tolerance --
+ * neighbors that already disagree with each other (a real, gradual scene
+ * trend) never round to a common count, so a genuine smooth ramp is left
+ * untouched. Blocking (rather than one median per whole row) catches a
+ * spike confined to part of a row's width (e.g. tied to one feature), not
+ * just a whole-row spike -- confirmed on a real scene: a single-row spike
+ * spanning only ~20% of the row's width, invisible to a whole-row median.
  */
 static void fix_cycle_spikes_1d(
     float *unw, const unsigned char *mask, int nrow, int ncol, bool by_row
 ) {
     const double TWO_PI = 2.0 * M_PI;
     const double TOL = 0.5; /* rad, around a clean cycle multiple */
+    /* Target column (or row) block size for the offset check below -- a
+     * spike can be confined to part of a line's width (e.g. one feature),
+     * not the whole line, so the median is computed per block rather than
+     * once per whole line. Small enough to localize such a spike, large
+     * enough for a stable median; a spike spanning a whole line still gets
+     * caught, since every block in it independently satisfies the same
+     * check. A spike whose true boundary falls inside a block (not on a
+     * block edge) leaves that one block uncorrected -- this is a target,
+     * not an exact size, specifically so blocks come out even (see below)
+     * rather than leaving a small, unreliable remainder block that would
+     * widen that same edge case further -- see the disproportionately
+     * unreliable remainder block this is avoiding. */
+    const int TARGET_BLOCK_LEN = 128;
     int n_lines = by_row ? nrow : ncol;
     int line_len = by_row ? ncol : nrow;
+    /* Even partition into n_blocks pieces near TARGET_BLOCK_LEN, same
+     * round-based approach as _auto_ntiles_by_target_size (Python side):
+     * blocks differ by at most one pixel, instead of a fixed block length
+     * with a ragged (and dis proportionately unreliable) last block. */
+    int n_blocks = std::max(1, (int)std::lround((double)line_len / TARGET_BLOCK_LEN));
 
-    std::vector<double> med(n_lines, std::numeric_limits<double>::quiet_NaN());
-    std::vector<uint8_t> have(n_lines, 0);
+    /* med(line, block), row-major: med[i * n_blocks + k] */
+    std::vector<double> med((size_t)n_lines * n_blocks,
+                             std::numeric_limits<double>::quiet_NaN());
+    std::vector<uint8_t> have((size_t)n_lines * n_blocks, 0);
     std::vector<float> buf;
-    buf.reserve(line_len);
+    buf.reserve(2 * TARGET_BLOCK_LEN);
+
     for (int i = 0; i < n_lines; ++i) {
-        buf.clear();
-        for (int j = 0; j < line_len; ++j) {
-            int r = by_row ? i : j;
-            int c = by_row ? j : i;
-            size_t gi = (size_t)r * ncol + c;
-            if (!mask || mask[gi] != 0) buf.push_back(unw[gi]);
-        }
-        if (buf.size() > 20) {
-            std::nth_element(buf.begin(), buf.begin() + buf.size() / 2, buf.end());
-            med[i] = buf[buf.size() / 2];
-            have[i] = 1;
+        for (int k = 0; k < n_blocks; ++k) {
+            int j0 = (int)std::lround((double)k * line_len / n_blocks);
+            int j1 = (int)std::lround((double)(k + 1) * line_len / n_blocks);
+            buf.clear();
+            for (int j = j0; j < j1; ++j) {
+                int r = by_row ? i : j;
+                int c = by_row ? j : i;
+                size_t gi = (size_t)r * ncol + c;
+                if (!mask || mask[gi] != 0) buf.push_back(unw[gi]);
+            }
+            size_t idx = (size_t)i * n_blocks + k;
+            if (buf.size() > 20) {
+                std::nth_element(buf.begin(), buf.begin() + buf.size() / 2, buf.end());
+                med[idx] = buf[buf.size() / 2];
+                have[idx] = 1;
+            }
         }
     }
 
     for (int i = 1; i < n_lines - 1; ++i) {
-        if (!have[i] || !have[i - 1] || !have[i + 1]) continue;
-        double up = med[i] - med[i - 1];
-        double down = med[i] - med[i + 1];
-        double n_up = std::round(up / TWO_PI);
-        double n_down = std::round(down / TWO_PI);
-        if (n_up == 0.0 || n_up != n_down) continue;
-        if (std::fabs(up - n_up * TWO_PI) > TOL) continue;
-        if (std::fabs(down - n_down * TWO_PI) > TOL) continue;
+        for (int k = 0; k < n_blocks; ++k) {
+            size_t idx = (size_t)i * n_blocks + k;
+            size_t idx_up = (size_t)(i - 1) * n_blocks + k;
+            size_t idx_down = (size_t)(i + 1) * n_blocks + k;
+            if (!have[idx] || !have[idx_up] || !have[idx_down]) continue;
 
-        float corr = (float)(n_up * TWO_PI);
-        for (int j = 0; j < line_len; ++j) {
-            int r = by_row ? i : j;
-            int c = by_row ? j : i;
-            size_t gi = (size_t)r * ncol + c;
-            if (!mask || mask[gi] != 0) unw[gi] -= corr;
+            double up = med[idx] - med[idx_up];
+            double down = med[idx] - med[idx_down];
+            double n_up = std::round(up / TWO_PI);
+            double n_down = std::round(down / TWO_PI);
+            if (n_up == 0.0 || n_up != n_down) continue;
+            if (std::fabs(up - n_up * TWO_PI) > TOL) continue;
+            if (std::fabs(down - n_down * TWO_PI) > TOL) continue;
+
+            float corr = (float)(n_up * TWO_PI);
+            int j0 = (int)std::lround((double)k * line_len / n_blocks);
+            int j1 = (int)std::lround((double)(k + 1) * line_len / n_blocks);
+            for (int j = j0; j < j1; ++j) {
+                int r = by_row ? i : j;
+                int c = by_row ? j : i;
+                size_t gi = (size_t)r * ncol + c;
+                if (!mask || mask[gi] != 0) unw[gi] -= corr;
+            }
+            med[idx] -= corr;
+            if (std::getenv("CUPHU_DEBUG"))
+                fprintf(stderr, "[cuphu] fix_cycle_spikes: %s %d block %d (%d-%d) "
+                        "shifted by %.0f*2pi\n",
+                        by_row ? "row" : "col", i, k, j0, j1, -n_up);
         }
-        med[i] -= corr;
-        if (std::getenv("CUPHU_DEBUG"))
-            fprintf(stderr, "[cuphu] fix_cycle_spikes: %s %d shifted by %.0f*2pi\n",
-                    by_row ? "row" : "col", i, -n_up);
     }
 }
 
